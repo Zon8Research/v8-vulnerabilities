@@ -1,0 +1,1 @@
+As found in b/74469145, we've determined that the SeqString's in TurboFan can actually change to ThinString at any time, so having SeqString doesn't really work.

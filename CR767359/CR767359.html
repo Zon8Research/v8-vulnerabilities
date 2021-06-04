@@ -1,0 +1,16 @@
+	<html><audio id="myAudio"></audio><script>
+	setTimeout(function(){location.reload()},152);
+	var offlineCtx = new OfflineAudioContext(27,1336353,23703);
+	var context = new AudioContext();
+	var streamDestNode  = context.createMediaStreamDestination();
+	var mediaRecorder= new MediaRecorder(streamDestNode.stream);
+	offlineCtx.oncomplete = function() {mediaRecorder.stop();pc0.close();}
+	mediaRecorder.start();
+	var rtcConfig = { "iceServers": [{ "urls": "stun:stun2.l.google.com:19302" },  ] };
+	var options = {optional:[{DtlsSrtpKeyAgreement:true}, {RtpDataChannels: true}]};
+	var pc0 = new RTCPeerConnection(rtcConfig,options);
+	pc0.createOffer(function(offer) {offlineCtx.startRendering().then(function() {});}, function(){});
+	var txDataChan = pc0.createDataChannel("DataChanName1");
+	setInterval(function(){pc0.createOffer(function(offer) {}, function(e) {mediaRecorder.resume();});}, 30);
+	var a = document.getElementById("myAudio");
+	</script></html>

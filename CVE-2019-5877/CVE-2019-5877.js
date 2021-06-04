@@ -1,0 +1,1 @@
+var malformedTypedArray = Reflect.construct(Uint8Array, [4], Proxy)
