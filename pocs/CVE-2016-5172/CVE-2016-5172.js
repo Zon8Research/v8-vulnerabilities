@@ -1,0 +1,10 @@
+this.__defineSetter__("x", function(){});
+function go (y = (function rec(a1, a2) {
+    // The position of "AAAA" controls a register value.
+    if (a1.length == a2) { b = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCAAAA"; }
+    rec(a1, a2 + 1);
+})([,], 0)
+        , b = eval("")
+        )
+{}
+go(x);

