@@ -1,4 +1,0 @@
-<script>
-var code = "new MessageChannel().port1.onmessage = function(){}; self.gc();";
-var worker = new Worker(window.URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
-</script>

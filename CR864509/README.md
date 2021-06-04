@@ -1,4 +1,0 @@
-Liftoff on x64 spills values to the stack by using "movl", hence the upper 32 bit are arbitrary (stale data from the stack). The spill slots can later directly be used as call arguments, which might end up on the stack again, in this case Liftoff just emits something like "push [rbp-0x48]". Hence it copies the uninitialized 32 bit over to the call argument stack slot. If the called function is compiled by Turbofan, it might load the 32 bit argument using a 64-bit load. Hence we end up with a not-zero-extended 32-bit value. This is problematic if that value is passed back to Liftoff, which assumes zero-extension and might use the value directly as memory offset.
-
-The easiest solution is to ensure that we zero extend all call argument stack slots.
-Another solution (long-term) is to make Turbofan use "movl" to load 32-bit values from the stack.
